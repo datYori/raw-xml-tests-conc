@@ -1,0 +1,15 @@
+raw: 0.9
+endpoint: GET
+metadata:
+  title: RAW XML Tests
+  description: RAW XML Tests
+  tags:
+    - rawxmltests
+code: rql
+declaration: publicastions_unnest_query5
+codeFile: raw-xml-tests.rql
+format: json
+security:
+  public: false
+computeClass: normal
+enabled: true

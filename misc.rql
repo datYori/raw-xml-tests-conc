@@ -1,0 +1,103 @@
+patients := READ_JSON("s3://rawlabs-private-test-data/xml-tests/patients.json")
+
+misc_patients_query0() := {
+  ccount(patients)
+};
+
+misc_patients_query1() := {
+  select p
+  from patients p
+  where p.gender = "male" and p.country = "Switzerland"
+};
+
+misc_patients_query2() := {
+  select p.patient_id, 
+         p.surname,
+         (
+          select d.description 
+          from p.patientBasedData.diagnosis d
+         ) as diagnosis
+  from patients p
+};
+
+misc_patients_query3() := {
+  select p.name, p.surname,
+         (
+          select d.description 
+          from p.patientBasedData.diagnosis d
+         ) as diagnosis,
+         (
+          select i.name 
+          from p.patientBasedData.formData f, f.items i
+         ) as forms
+  from patients p where p.surname = "Thomas"
+};
+misc_patients_query4() := {
+  select gender,
+         city,
+         (
+          select x.d 
+          from partition x
+         ) as diagnosis 
+  from (
+        select p.gender, 
+               p.city,
+               (
+                select d.description 
+                from p.patientBasedData.diagnosis d
+               ) as diagnosis
+        from patients p where p.country = "Portugal"
+       ) T, T.diagnosis d
+  group by gender: T.gender, city: T.city
+};
+misc_patients_query5() := {
+  select gender,
+         (
+          select x.d
+          from partition x
+         ) as diagnosis,
+         (
+          select x.f
+          from partition x
+         ) as forms
+  from (
+        select p.gender, p.city,
+              (
+                select d.description
+                from p.patientBasedData.diagnosis d
+              ) as diagnosis,
+              (
+                select  i.name
+                from p.patientBasedData.formData f, f.items i
+              ) as forms
+        from patients p where p.city = "Oporto"
+      ) T, T.diagnosis d, T.forms f
+  group by gender: T.gender, city: T.city
+};
+misc_patients_query6() := {
+  select city,
+         csum(
+              select p.med 
+              from partition p
+             ) as N
+  from (
+        select p.city as city, ccount(p.chartBasedData.medication) as med
+        from patients p
+      ) T
+  group by city: T.city
+};
+misc_patients_query7() := {
+
+};
+misc_patients_query8() := {
+
+};
+misc_patients_query9() := {
+
+};
+misc_patients_query10() := {
+
+};
+misc_patients_query11() := {
+
+};

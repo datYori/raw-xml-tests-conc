@@ -1,0 +1,35 @@
+publications := READ_HJSON("s3://rawlabs-private-test-data/publications.hjson")
+authors := READ_HJSON("s3://rawlabs-private-test-data/authors.hjson")
+
+publicastions_unnest_query0() := {
+  select title, name from authors order by title, name
+};
+publicastions_unnest_query1() := {
+  select A as author from publications P, P.authors A where P.title = "Open Access"
+};
+publicastions_unnest_query2() := {
+  select A as author from publications P, P.authors A where A = "Cabrera, B."
+};
+publicastions_unnest_query3() := {
+  select p.title, ccount(select a from a in p.authors where a = "x") as n
+  from p in publications
+  where p.title = "Open Access"
+};
+publicastions_unnest_query4() := {
+  startWith := \x: string, l: string -> parse(x, r"(.).*") = l;
+  select p.title, ccount(select a from a in p.authors where startWith(a, "D")) as n
+  from p in publications where p.title = "Open Access"
+};
+publicastions_unnest_query5() := {
+    firstletter := \x: string -> parse(x, r"(.).*");
+    // count how many authors have a first letter equal to the first letter of the title
+    // of a publication
+    n1 := \(title: string, authors: collection(string)) -> ccount(select *
+                 from a in authors
+                 where firstletter(a) = firstletter(title));
+    // returns the publications which title starts with 'W' and have certain authors' names
+    // starting with the same letter
+    select p.title, p.authors, n1(p.title, p.authors)
+    from p in publications
+    where firstletter(p.title) = "W" and n1(p.title, p.authors) > 0
+};

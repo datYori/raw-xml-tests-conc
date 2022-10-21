@@ -1,0 +1,16 @@
+raw: 0.9
+endpoint: GET
+metadata:
+  title: RAW XML Tests
+  description: RAW XML Tests
+  tags:
+    - rawxmltests
+    - tvshows
+code: rql
+declaration: tv_shows_query0
+codeFile: tvshows.rql
+format: json
+security:
+  public: false
+computeClass: normal
+enabled: true

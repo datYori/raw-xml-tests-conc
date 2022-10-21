@@ -1,0 +1,1159 @@
+rsiDaysAsDate :=
+  \days: string -> {
+    // Use EmissionDate which is a timestamp since 1900-01-01 and apply -2 days correction
+    d := DATE "1900-01-01" + TRY_CAST(days AS int) - 2;
+   REPLACE(CAST(d AS string) + "Z", " ", "T")
+  };
+
+rsiParsedText :=
+  \txt: string, reg: regex(2) -> {
+    p := TRY_PARSE(REPLACE(txt, "\n", ""), reg);
+    TRIM(p._2)
+  };
+
+
+rsiExtractedTitles := 
+  \txt: string -> {
+     // Extract Program title which is after keywords PROGRAMMA or PRODUZIONE (we take only the 2nd group) 
+    pRaw := rsiParsedText(txt, r""".*(PROGRAMMA|PRODUZIONE).-.([^;]+).*""");
+    // Remove extraenous info from program titles. Everything after chars ( > < is removed
+    p := TRIM(TRY_PARSE(pRaw, r"""([^(^>^<]+).*"""));
+    // Broadcast title same as Program title but with other keywords
+    bRaw := rsiParsedText(txt, r""".*(TITOLO|PUNTATA).-.([^;]+).*""");
+    // Remove program title from broadcast title when present
+    b := TRIM(COALESCE(REPLACE(REPLACE(bRaw, pRaw + " - ", ""), pRaw, ""), bRaw));
+    (program: p, broadcast: b)
+  };
+
+rsiCleanedText := 
+  \txt: string -> {
+        // Remove Geo tags from description and ;
+        TRIM(REPLACE(COALESCE(TRY_PARSE(txt, r"[^>]+ > [^-]+ -(.*)$"), txt), ";", ""))
+  };
+
+rsiCleanedPersons := 
+  \persons: Collection(String) -> {
+        // Remove function after coma, if present
+        persons PARSE AS r"""([^,]*)[,]?.*"""
+  };
+
+swi_radio_ids := {
+  TYPEALIAS t :=
+  record(
+          Program: collection(
+              record(
+                  ID: string,
+                  BroadcastTitle: string nullable,
+                  Transmission: record(ProgramDate: timestamp nullable, Channel: string nullable) nullable,
+                  ProgramTitle: string nullable,
+                  SeriesTitle: string nullable,
+                  ProgramLenght: int nullable,
+                  Item: collection(
+                      record(
+                          ItemTitle: string nullable,
+                          Abstract: string nullable,
+                          Rights: collection(record(RightTerm: string) nullable),
+                          TopicDescriptor: collection(
+                              record(TopicTerm: string) nullable
+                              )
+                            )
+                  )
+              )
+            )
+          );
+
+  SELECT p
+      FROM
+      read_many_xml[t]("s3://rawlabs-private-test-data/SSR/Program_SRF_TV_20010101-20051231__new_v2/Program_SWI*.xml") f,
+      f.Program p
+  };
+
+  swi_radio_common := 
+  SELECT
+          // Hard set data
+          "SWI_RADIO" AS source,
+          Transmission.Channel AS channel,
+          "swi" as enterpriseUnit,
+          "audio" AS mediaType,
+          ProgramLenght AS duration,
+          
+          // Data in common model but not SWI (for now)
+          NULL AS persons,
+          NULL AS corporations,
+          NULL AS mediaURL,
+          NULL AS imageURL,
+          
+          ID AS sourceId,
+          CONCAT("SWI_RADIO_", ID) AS id,
+          
+          (SELECT COALESCE(TRIM(TRY_PARSE(Abstract, r""".+<.+:(.*)""")), Abstract) FROM Item) AS abstracts,
+          MKSTRING((SELECT COALESCE(TRIM(TRY_PARSE(Abstract, r""".+<.+:(.*)""")), Abstract) FROM Item), "\n\n") AS abstract,
+          
+          // programTitle first non null in the order or null if all null
+          COALESCE(BroadcastTitle, SeriesTitle, ProgramTitle) AS programTitle,
+          // programTitle source for debug purpose
+          CASE
+              WHEN BroadcastTitle IS NOT NULL THEN "BroadcastTitle"
+              WHEN SeriesTitle IS NOT NULL THEN "SeriesTitle"
+              WHEN ProgramTitle IS NOT NULL THEN "ProgramTitle"
+              ELSE NULL
+          END AS programTitleSource,
+          
+          // title construction:
+          //   Use SeriesTitle and ProgramTitle concatened if both not null,
+          //   or just ProgramTitle if not null,
+          //   or just SeriesTitle if not null,
+          //   or BroadcastTitle (if not null) (same as programTitle) with date (join by a "vom" since it is German speaking programs)
+          //   finally if there is nothing just null
+          CASE
+             WHEN ProgramTitle IS NOT NULL AND SeriesTitle IS NOT NULL THEN CONCAT(SeriesTitle, ": ", ProgramTitle)
+             WHEN ProgramTitle IS NOT NULL THEN ProgramTitle
+             WHEN SeriesTitle IS NOT NULL THEN SeriesTitle
+             WHEN BroadcastTitle IS NOT NULL THEN
+                 CONCAT(BroadcastTitle, " vom ", 
+                         cast((day(Transmission.ProgramDate)) as string),
+                         ".",
+                         cast((month(Transmission.ProgramDate)) as string),
+                         ".",
+                         cast((year(Transmission.ProgramDate)) as string)
+                  )
+             ELSE NULL
+          END AS title,
+          
+          // Parse ISO8601 for publicationTimestamp
+          Transmission.ProgramDate AS publicationTimestamp,
+          // Keep ISO8601 for publicationDate
+          cast(Transmission.ProgramDate as string) + "Z" AS publicationDate,
+          
+          // Chapters nested objects creation
+          (SELECT 
+               ItemTitle AS title,
+               // Remove the Geographics data at the start of abstract. If regex not found (null) use the normal Abstract
+               COALESCE(TRIM(TRY_PARSE(Abstract, r""".+<.+:(.*)""")), Abstract) AS abstract,
+               NULL AS geographicals,
+               (SELECT LOWER(TRIM(TopicTerm)) FROM TopicDescriptor) as topics,
+               (SELECT RightTerm FROM Rights) as rights
+          FROM Item) AS chapters,
+          
+          // Flattened Geo
+          NULL AS geographicals,
+          
+          // Flattened Topic
+          (IF CCOUNT((SELECT TopicTerm FROM Item, TopicDescriptor)) > 0
+              THEN (SELECT LOWER(TRIM(TopicTerm)) FROM Item, TopicDescriptor)
+              ELSE NULL) AS topics,
+              
+          // Flattened Right
+          (IF CCOUNT((SELECT RightTerm FROM Item, Rights)) > 0
+              THEN (SELECT RightTerm FROM Item, Rights)
+              ELSE NULL) AS rights
+           
+      FROM swi_radio_ids;
+
+  rtr_radio_ids := 
+  SELECT p
+      FROM
+      read_many_xml[record(
+          Program: collection(
+              record(
+                  ID: string,
+                  BroadcastTitle: string nullable,
+                  Transmission: record(ProgramDate: timestamp nullable, Channel: string nullable) nullable,
+                  ProgramTitle: string nullable,
+                  SeriesTitle: string nullable,
+                  ProgramLenght: int,
+                  Item: collection(
+                      record(
+                          ItemTitle: string nullable,
+                          Abstract: string nullable,
+                          Rights: collection(record(RightTerm: string) nullable),
+                          TopicDescriptor: collection(
+                              record(TopicTerm: string) nullable))))))]
+        ("s3://rawlabs-private-test-data/SSR/Program_SRF_TV_20010101-20051231__new_v2/Program_RTR_Radio*.xml",
+                   encoding := "utf-8"
+                   ) f, f.Program p;
+
+  rtr_radio_common := 
+  SELECT
+          // Hard set data
+          "RTR_RADIO" AS source,
+          Transmission.Channel AS channel,
+          "rtr" as enterpriseUnit,
+          "audio" AS mediaType,
+          ProgramLenght AS duration,
+          
+          // Data in common model but not RTR (for now)
+          NULL AS persons,
+          NULL AS corporations,
+          NULL AS mediaURL,
+          NULL AS imageURL,
+          
+          ID AS sourceId,
+          CONCAT("RTR_RADIO_", ID) AS id,
+          
+          (SELECT COALESCE(TRIM(TRY_PARSE(Abstract, r""".+<.+:(.*)""")), Abstract) FROM Item) AS abstracts,
+          MKSTRING((SELECT COALESCE(TRIM(TRY_PARSE(Abstract, r""".+<.+:(.*)""")), Abstract) FROM Item), "\n\n") AS abstract,
+          
+          // programTitle first non null in the order or null if all null
+          COALESCE(BroadcastTitle, SeriesTitle, ProgramTitle) AS programTitle,
+          // programTitle source for debug purpose
+          CASE
+              WHEN BroadcastTitle IS NOT NULL THEN "BroadcastTitle"
+              WHEN SeriesTitle IS NOT NULL THEN "SeriesTitle"
+              WHEN ProgramTitle IS NOT NULL THEN "ProgramTitle"
+              ELSE NULL
+          END AS programTitleSource,
+          
+          // title construction:
+          //   Use SeriesTitle and ProgramTitle concatened if both not null,
+          //   or just ProgramTitle if not null,
+          //   or just SeriesTitle if not null,
+          //   or BroadcastTitle (if not null) (same as programTitle) with date (join by a "vom" since it is German speaking programs)
+          //   finally if there is nothing just null
+          CASE
+             WHEN ProgramTitle IS NOT NULL AND SeriesTitle IS NOT NULL THEN CONCAT(SeriesTitle, ": ", ProgramTitle)
+             WHEN ProgramTitle IS NOT NULL THEN ProgramTitle
+             WHEN SeriesTitle IS NOT NULL THEN SeriesTitle
+             WHEN BroadcastTitle IS NOT NULL THEN
+                 CONCAT(BroadcastTitle, " vom ", 
+                         cast((day(Transmission.ProgramDate)) as string),
+                         ".",
+                         cast((month(Transmission.ProgramDate)) as string),
+                         ".",
+                         cast((year(Transmission.ProgramDate)) as string)
+                  )
+             ELSE NULL
+          END AS title,
+          
+          // Parse ISO8601 for publicationTimestamp
+          Transmission.ProgramDate AS publicationTimestamp,
+          // Keep ISO8601 for publicationDate
+          cast(Transmission.ProgramDate as string) + "Z" AS publicationDate,
+          
+          // Chapters nested objects creation
+          (SELECT 
+               ItemTitle AS title,
+               // Remove the Geographics data at the start of abstract. If regex not found (null) use the normal Abstract
+               COALESCE(TRIM(TRY_PARSE(Abstract, r""".+<.+:(.*)""")), Abstract) AS abstract,
+               NULL AS geographicals,
+               (SELECT LOWER(TRIM(TopicTerm)) FROM TopicDescriptor) as topics,
+               (SELECT RightTerm FROM Rights) as rights
+          FROM Item) AS chapters,
+          
+          // Flattened Geo
+          NULL AS geographicals,
+          
+          // Flattened Topic
+          (IF CCOUNT((SELECT TopicTerm FROM Item, TopicDescriptor)) > 0
+              THEN (SELECT LOWER(TRIM(TopicTerm)) FROM Item, TopicDescriptor)
+              ELSE NULL) AS topics,
+              
+          // Flattened Right
+          (IF CCOUNT((SELECT RightTerm FROM Item, Rights)) > 0
+              THEN (SELECT RightTerm FROM Item, Rights)
+              ELSE NULL) AS rights
+           
+      FROM rtr_radio_ids;
+
+  rtr_tv_ids := {
+  TYPEALIAS t :=
+  record(
+        Program: collection(
+            record(
+                ID: string,
+                BroadcastTitle: string nullable,
+                Transmission: record(ProgramDate: timestamp nullable, Channel: string nullable) nullable,
+                ProgramTitle: string nullable,
+                SeriesTitle: string nullable,
+                ProgramLenght: int nullable,
+                Item: collection(
+                    record(
+                        ItemTitle: string nullable,
+                        Abstract: string nullable,
+                        Rights: collection(record(RightTerm: string) nullable),
+                        GeoDescriptor: collection(
+                            record(GeoTerm: string) nullable),
+                        TopicDescriptor: collection(
+                            record(TopicTerm: string) nullable))))));
+    SELECT p
+    FROM
+    read_many_xml("s3://rawlabs-private-test-data/SSR/Program_SRF_TV_20010101-20051231__new_v2/Program_RTR_TV_*.xml",
+                 encoding := "utf-8") f, f.Program p
+
+};
+
+rtr_tv_common := {
+    SELECT
+        "RTR_TV" AS source,
+        Transmission.Channel AS channel,
+        "rtr" as enterpriseUnit,
+        "video" AS mediaType,
+        ProgramLenght AS duration,
+        
+        // Data in common model but not RTR (for now)
+        NULL AS persons,
+        NULL AS corporations,
+        NULL AS mediaURL,
+        NULL AS imageURL,
+        
+        ID AS sourceId,
+        CONCAT("RTR_TV_", ID) AS id,
+        
+        (SELECT COALESCE(TRIM(TRY_PARSE(Abstract, r""".+<.+:(.*)""")), Abstract) FROM Item) AS abstracts,
+        MKSTRING((SELECT COALESCE(TRIM(TRY_PARSE(Abstract, r""".+<.+:(.*)""")), Abstract) FROM Item), "\n\n") AS abstract,
+        
+        // programTitle first non null in the order or null if all null
+        COALESCE(BroadcastTitle, SeriesTitle, ProgramTitle) AS programTitle,
+        // programTitle source for debug purpose
+        CASE
+            WHEN BroadcastTitle IS NOT NULL THEN "BroadcastTitle"
+            WHEN SeriesTitle IS NOT NULL THEN "SeriesTitle"
+            WHEN ProgramTitle IS NOT NULL THEN "ProgramTitle"
+            ELSE NULL
+        END AS programTitleSource,
+        
+        // title construction:
+        //   Use SeriesTitle and ProgramTitle concatened if both not null,
+        //   or just ProgramTitle if not null,
+        //   or just SeriesTitle if not null,
+        //   or BroadcastTitle (if not null) (same as programTitle) with date (join by a "vom" since it is German speaking programs)
+        //   finally if there is nothing just null
+        CASE
+           WHEN ProgramTitle IS NOT NULL AND SeriesTitle IS NOT NULL THEN CONCAT(SeriesTitle, ": ", ProgramTitle)
+           WHEN ProgramTitle IS NOT NULL THEN ProgramTitle
+           WHEN SeriesTitle IS NOT NULL THEN SeriesTitle
+           WHEN BroadcastTitle IS NOT NULL THEN
+               CONCAT(BroadcastTitle, " vom ", 
+                       cast((day(Transmission.ProgramDate)) as string),
+                       ".",
+                       cast((month(Transmission.ProgramDate)) as string),
+                       ".",
+                       cast((year(Transmission.ProgramDate)) as string)
+                )
+           ELSE NULL
+        END AS title,
+        
+        // Parse ISO8601 for publicationTimestamp
+        Transmission.ProgramDate AS publicationTimestamp,
+        // Keep ISO8601 for publicationDate
+        cast(Transmission.ProgramDate as string) + "Z" AS publicationDate,
+        
+        // Chapters nested objects creation
+        (SELECT 
+             ItemTitle AS title,
+             // Remove the Geographics data at the start of abstract. If regex not found (null) use the normal Abstract
+             COALESCE(TRIM(TRY_PARSE(Abstract, r""".+<.+:(.*)""")), Abstract) AS abstract,
+             (SELECT GeoTerm FROM GeoDescriptor) AS geographicals,
+             (SELECT LOWER(TRIM(TopicTerm)) FROM TopicDescriptor) as topics,
+             (SELECT RightTerm FROM Rights) as rights
+        FROM Item) AS chapters,
+        
+        // Flattened Geo
+        (IF CCOUNT((SELECT GeoTerm FROM Item, GeoDescriptor)) > 0
+            THEN (SELECT GeoTerm FROM Item, GeoDescriptor)
+            ELSE NULL) AS geographicals,
+        
+        // Flattened Topic
+        (IF CCOUNT((SELECT TopicTerm FROM Item, TopicDescriptor)) > 0
+            THEN (SELECT LOWER(TRIM(TopicTerm)) FROM Item, TopicDescriptor)
+            ELSE NULL) AS topics,
+            
+        // Flattened Right
+        (IF CCOUNT((SELECT RightTerm FROM Item, Rights)) > 0
+            THEN (SELECT RightTerm FROM Item, Rights)
+            ELSE NULL) AS rights
+         
+    FROM rtr_tv_ids
+};
+
+broadcasts_search_2 := {
+    urlEncode(s: string) := "%22" + replace(s, " ", "%20") + "%22";
+    \(pattern: string nullable, blockSize: int nullable, higherLimit: int nullable, minDate: date nullable, maxDate: date nullable) -> {
+      endpoint := "http://www.rts.ch/services/archives/da/v1/api/broadcasts";
+      defaultParameters := "partialResponseChunks=C%2CS%2CM%2CT%2CV&onlyPublishable=true&sort=-publicationDate";
+      blockSizeInt := isnull(blockSize, 500);
+      query := "";// CASE WHEN pattern IS NULL OR trim(pattern) = "" THEN "" ELSE concat("&query=", trim(pattern)) END;
+      blockSizeStr := "&rows=" + CAST(blockSizeInt as STRING);
+      minDateStr := CASE WHEN minDate IS NULL THEN "" ELSE "&minPublicationDate=" + CAST(minDate as STRING) END;
+      maxDateStr := CASE WHEN maxDate IS NULL THEN "" ELSE "&maxPublicationDate=" + CAST(maxDate as STRING) END;
+      url := concat(endpoint, "?", defaultParameters, blockSizeStr, query, minDateStr, maxDateStr);
+      r := read_json[record(
+      meta: record(
+          count: int,
+          previousHref: string nullable,
+          nextHref: string nullable,
+          lastHref: string nullable,
+          firstHref: string nullable,
+          selfHref: string nullable))](url);
+      SELECT row
+      FROM 
+      idx IN range(0, ISNULL(higherLimit, r.meta.count) , blockSizeInt),
+      url + "&start=" + idx AS url2, // url with 'start=N'
+      read_json[record(
+      meta: record(
+          count: int,
+          previousHref: string nullable,
+          nextHref: string nullable,
+          lastHref: string nullable,
+          firstHref: string nullable,
+          selfHref: string nullable),
+      data: collection(
+          record(
+              id: string,
+              mediaType: string,
+              publicationDate: string nullable,
+              webPublicationDate: string nullable,
+              publicationChannelNames: collection(string nullable) nullable,
+              program: record(name: string nullable, id: string nullable, href: string nullable) nullable,
+              genres: collection(string nullable) nullable,
+              isOnline: string nullable,
+              mediaURL: string nullable,
+              articleURL: string nullable,
+              imageURL: string nullable,
+              backgrounds: collection(string) nullable,
+              alternativeTitle: collection(string) nullable,
+              alternativeSummary: collection(string) nullable,
+              variantIds: collection(string) nullable,
+              source: string,
+              sequences: collection(
+                  record(
+                      id: string nullable,
+                      internalArchiveId: string nullable,
+                      summary: string nullable,
+                      visualThemes: collection(string) nullable,
+                      visualGeographicals: collection(string) nullable,
+                      visualPersons: collection(string) nullable,
+                      visualCorporations: collection(string) nullable)) nullable,
+              lastModifiedDate: string nullable,
+              chapters: collection(
+                  record(
+                      sequenceIds: collection(string) nullable,
+                      title: string nullable,
+                      summary: string nullable,
+                      durationSec: int nullable,
+                      excerpt: string nullable,
+                      internalArchiveId: string nullable,
+                      remarks: string nullable,
+                      contributors: collection(
+                          record(
+                              function: string nullable,
+                              name: string nullable,
+                              role: string nullable,
+                              type: string nullable)) nullable,
+                      thematicThemes: collection(string) nullable,
+                      thematicGeographicals: collection(string) nullable,
+                      thematicPersons: collection(string) nullable,
+                      thematicCorporations: collection(string) nullable,
+                      // scripts: collection(string) nullable,
+                      speechToTexts: collection(string) nullable,
+                      subTitles: collection(string) nullable,
+                      medias: collection(
+                          record(
+                              id: string,
+                              version: int nullable,
+                              comment: string nullable,
+                              isColor: string nullable,
+                              ratio: string nullable,
+                              definition: string nullable,
+                              audioSynthesis: string nullable,
+                              medium: record(id: string nullable, position: string nullable) nullable)) nullable)
+                  ) nullable,
+              title: string nullable,
+              summary: string nullable,
+              durationSec: int nullable,
+              internalArchiveId: string nullable,
+              remarks: string nullable,
+              contributors: collection(
+                  record(
+                      function: string nullable,
+                      name: string nullable,
+                      role: string nullable,
+                      type: string nullable)) nullable,
+              thematicThemes: collection(string) nullable,
+              thematicGeographicals: collection(string) nullable,
+              thematicPersons: collection(string) nullable,
+              thematicCorporations: collection(string) nullable,
+              scripts: collection(string) nullable,
+              speechToTexts: collection(string) nullable,
+              subTitles: collection(string) nullable,
+              medias: collection(
+                  record(
+                      id: string,
+                      version: int nullable,
+                      comment: string nullable,
+                      isColor: string nullable,
+                      ratio: string nullable,
+                      definition: string nullable,
+                      audioSynthesis: string nullable,
+                      medium: record(id: string nullable, position: string nullable) nullable)) nullable)),
+      facetCounts: record(
+          enumerates: record(
+              mediaType: record(some_media_type: int, other_media_type: int) nullable,
+              program: record(some_program_name: int, other_program_name: int) nullable,
+              publicationChannelNames: record(
+                  some_channel_name: int,
+                  other_channel_name: int) nullable,
+              genres: record(some_genre: int, other_genre: int) nullable
+          ) nullable,
+          intervals: record(
+              publicationDate: record(`1960`: int, after: int) nullable,
+              durationSec: record(`120`: int, after: int) nullable
+              ) nullable
+          ) nullable
+      )](url2, encoding := "utf-8").data row
+  }
+ };
+
+v_rts_ws := {
+        a := SELECT  
+        "RTS" as source
+        ,id as sourceId
+        ,CONCAT("RTS_", id) AS id
+        ,mediaType as mediaType
+        ,durationSec as duration
+        ,program.name as programTitle
+        ,NULL programTitleSource
+        ,title
+        ,summary
+        ,publicationChannelNames as channels
+        ,COALESCE(publicationDate, webPublicationDate) as publicationDate
+        ,mediaURL
+        ,imageURL
+        ,(SELECT 
+                title
+                ,COALESCE(excerpt, summary) as content
+                ,(SELECT LOWER(TRIM(*)) FROM thematicThemes) as topics
+                ,(SELECT LOWER(TRIM(*)) FROM thematicGeographicals) as geo
+                ,(SELECT LOWER(TRIM(*)) FROM thematicPersons) as persons
+                ,(SELECT LOWER(TRIM(*)) FROM thematicCorporations) as corporations
+            FROM chapters) AS chapters
+        ,(SELECT 
+                (SELECT LOWER(TRIM(*)) FROM visualThemes) as topics
+                ,(SELECT LOWER(TRIM(*)) FROM visualGeographicals) as geo
+                ,(SELECT LOWER(TRIM(*)) FROM visualPersons) as persons
+                ,(SELECT LOWER(TRIM(*)) FROM visualCorporations) as corporations
+            FROM sequences) AS sequences
+        FROM broadcasts_search_2(null, 500, null, date "1995-01-01", date "2005-12-31");
+
+        SELECT
+        *
+        FROM a
+};
+
+rts_common := {
+    SELECT 
+      source
+      ,sourceId
+      ,"rts" as enterpriseUnit
+      ,id
+      ,CASE
+          // if an channels array is existing the take only the first element
+          WHEN EXISTS(channels) THEN CFIRST(channels)
+          ELSE NULL
+      END AS channel
+      ,title
+      ,[summary] AS abstracts
+      ,publicationDate
+      ,mediaType
+      ,duration
+      ,programTitle
+      ,mediaURL
+      ,imageURL
+      // if any topic is found in any chapter or sequence then return it
+      ,CASE
+              WHEN CCOUNT((SELECT c.topics FROM chapters c)) > 0 OR CCOUNT((SELECT s.topics FROM sequences s)) > 0
+          THEN ((SELECT topic FROM chapters c, c.topics topic) UNION (SELECT topic FROM sequences s, s.topics topic))
+          ELSE NULL
+       END as topics
+      ,CASE
+          // if any geo tag is found in any chapter or sequence then return it
+          WHEN CCOUNT((SELECT c.geo FROM chapters c)) > 0 OR CCOUNT((SELECT s.geo FROM sequences s)) > 0
+          THEN (SELECT geo FROM chapters c, c.geo geo) UNION (SELECT geo FROM sequences s, s.geo geo)
+          ELSE NULL
+       END as geographicals
+       ,CASE
+          // if any person tag is found in any chapter or sequence then return it
+          WHEN CCOUNT((SELECT c.persons FROM chapters c)) > 0 OR CCOUNT((SELECT s.persons FROM sequences s)) > 0
+          THEN (SELECT person FROM chapters c, c.persons person) UNION (SELECT person FROM sequences s, s.persons person)
+          ELSE NULL
+       END as persons
+       ,CASE
+          // if any corporation tag is found in any chapter or sequence then return it
+          WHEN CCOUNT((SELECT c.corporations FROM chapters c)) > 0 OR CCOUNT((SELECT s.corporations FROM sequences s)) > 0
+          THEN (SELECT corporation FROM chapters c, c.corporations corporation) UNION (SELECT corporation FROM sequences s, s.corporations corporation)
+          ELSE NULL
+       END as corporations
+    FROM
+      v_rts_ws
+};
+
+rsi_radio := {
+    TYPEALIAS t := collection(
+        record(
+          CmmID: double,
+          IdDigital: string, // <-- int or ""
+          Rights: string,
+          Description: string,
+          TitleFull: string,
+          ShowTitle: string,
+          Limits: string,
+          GeoTags: collection(string),
+          EditorialFormat: collection(string),
+          Persons: collection(string),
+          DurationSeconds: int,
+          Duration: string,
+          EmissionDateString: string,
+          EmissionDate: string,
+          Titles: collection(string),
+          Keywords: collection(string),
+          EditorialContent: string
+        )
+    );
+    SELECT
+      CAST(CmmID AS int) as sourceId,
+      "RSI_RADIO" AS source,
+      "RSI" AS channel,
+      "audio" as mediaType,
+      TRY_CAST(DurationSeconds AS int) as duration,
+      rsiDaysAsDate(EmissionDate) AS publicationDate,
+      rsiExtractedTitles(TitleFull) AS title,
+      rsiCleanedText(Description) AS abstract,
+      Rights AS rights,
+      GeoTags AS geographicals,
+      Keywords AS topics,
+      rsiCleanedPersons(Persons) AS persons,
+      [] AS corporations
+    FROM read_many_json[t](
+      "s3://rawlabs-private-test-data/SSR/ArchiveImport/Radio/*",
+      encoding := "iso-8859-1"
+    )
+};
+
+rsi_radio_common := {
+      SELECT
+        "rsi-" + sourceId AS id,
+        "rsi" as enterpriseUnit,
+        source, sourceId, channel, mediaType, duration, publicationDate,
+        title.program AS programTitle,
+        title.broadcast AS title,
+        [abstract] as abstracts,
+        rights,
+        (SELECT lower(trim(*)) from geographicals WHERE LEN(TRIM(*)) > 0) AS geographicals,
+        (SELECT lower(trim(*)) from topics WHERE LEN(TRIM(*)) > 0) AS topics,
+        (SELECT lower(trim(*)) from persons WHERE LEN(TRIM(*)) > 0) AS persons,
+        (SELECT lower(trim(*)) from corporations WHERE LEN(TRIM(*)) > 0) AS corporations,
+        NULL AS mediaURL,
+        NULL AS imageURL
+      FROM rsi_radio
+};
+
+rsi_tv := {
+  TYPEALIAS t := collection(
+        record(
+          CmmID: double,
+          IdDigital: string,
+          Rights: string,
+          Description: string,
+          TitleFull: string,
+          ShowTitle: string,
+          Limits: string,
+          GeoTags: collection(string),
+          EditorialFormat: string,
+          Persons: collection(string),
+          DurationSeconds: string,
+          Duration: string,
+          EmissionDateString: string,
+          EmissionDate: string,
+          Titles: collection(string),
+          Keywords: collection(string),
+          MainThemesFull: string,
+          MainThemes: collection(string),
+          AssetTitle: string nullable,
+          JuridicalPersons: string
+        )
+      );
+
+    SELECT
+      CAST(CmmID AS int) as sourceId,
+      "RSI_TV" AS source,
+      "RSI" AS channel,
+      "video" AS mediaType,
+      TRY_CAST(DurationSeconds AS int) AS duration,
+      rsiDaysAsDate(EmissionDate) AS publicationDate,
+      rsiExtractedTitles(TitleFull) AS title,
+      rsiCleanedText(Description) AS abstract,
+      Rights AS rights,
+      GeoTags AS geographicals,
+      Keywords AS topics,
+      rsiCleanedPersons(Persons) AS persons,
+      rsiCleanedPersons(SPLIT(JuridicalPersons, "\n")) AS corporations
+    FROM read_many_json[t](
+      "s3://rawlabs-private-test-data/SSR/ArchiveImport/TV/*",
+      encoding := "iso-8859-1"
+    )
+};
+
+rsi_tv_common := {
+    SELECT
+      "rsi-" + sourceId AS id,
+      "rsi" as enterpriseUnit,
+      source, sourceId, channel, mediaType, duration, publicationDate,
+      title.program AS programTitle,
+      title.broadcast AS title,
+      [abstract] as abstracts,
+      rights,
+      (SELECT lower(trim(*)) from geographicals WHERE LEN(TRIM(*)) > 0) AS geographicals,
+      (SELECT lower(trim(*)) from topics WHERE LEN(TRIM(*)) > 0) AS topics,
+      (SELECT lower(trim(*)) from persons WHERE LEN(TRIM(*)) > 0) AS persons,
+      (SELECT lower(trim(*)) from corporations WHERE LEN(TRIM(*)) > 0) AS corporations,
+      NULL AS mediaURL,
+      NULL AS imageURL
+    FROM rsi_tv
+};
+
+srf_radio_ids := {
+  TYPEALIAS t := record(
+          Program: collection(
+              record(
+                  ID: string,
+                  BroadcastTitle: string nullable,
+                  Transmission: record(ProgramDate: timestamp nullable, Channel: string nullable) nullable,
+                  ProgramTitle: string nullable,
+                  SeriesTitle: string nullable,
+                  ProgramLenght: int nullable,
+                  Item: collection(
+                      record(
+                          ItemTitle: string nullable,
+                          Abstract: string nullable,
+                          Rights: collection(record(RightTerm: string) nullable),
+                          TopicDescriptor: collection(
+                              record(TopicTerm: string) nullable))))));
+
+  SELECT p
+      FROM
+      read_many_xml[t]("s3://rawlabs-private-test-data/SSR/Program_SRF_TV_20010101-20051231__new_v2/Program_SRF_Radio*.xml",
+                   encoding := "utf-8") f, f.Program p
+};
+
+imageUrls := {
+    SELECT
+      f.faroId
+      ,f.imageUrl
+    FROM READ("s3://rawlabs-private-test-data/SSR/imageUrls_chapters-1.csv") f
+    WHERE f.imageUrl != "None"
+    UNION ALL
+    SELECT
+      f.faroId
+      ,f.imageUrl
+    FROM READ("s3://rawlabs-private-test-data/SSR/imageUrls_chapters-2.csv") f
+    WHERE f.imageUrl != "None"
+    UNION ALL
+    SELECT
+      f.faroId
+      ,f.imageUrl
+    FROM READ("s3://rawlabs-private-test-data/SSR/imageUrls_chapters-3.csv") f
+    WHERE f.imageUrl != "None"
+    UNION ALL
+    SELECT
+      f.faroId
+      ,f.imageUrl
+    FROM READ("s3://rawlabs-private-test-data/SSR/imageUrls_chapters-4.csv") f
+    WHERE f.imageUrl != "None"
+    UNION ALL
+    SELECT
+      f.faroId
+      ,f.imageUrl
+    FROM READ("s3://rawlabs-private-test-data/SSR/imageUrls_chapters-5.csv") f
+    WHERE f.imageUrl != "None"
+};
+
+mediaIds := {
+  SELECT DISTINCT
+    f.`#faroSeId` as faroId
+    ,"Chapter" as mediaType
+    ,f.assetSetId as mediaId
+    ,cfirst(select i.imageUrl from imageUrls i where i.faroId = f.`#faroSeId`) as imageUrl
+  FROM READ("s3://rawlabs-private-test-data/SSR/Konkordanzliste.xlsx") f
+  WHERE f.assetSetId IS NOT NULL
+  UNION ALL
+  SELECT DISTINCT
+    f.faroBeitragsId as faroId
+    ,"Segment" as mediaType
+    ,f.assetId as mediaId
+    ,NULL as imageUrl
+  FROM READ("s3://rawlabs-private-test-data/SSR/Konkordanzliste.xlsx") f
+  WHERE f.assetId IS NOT NULL
+};
+
+srf_radio_common := {
+  SELECT
+          // Hard set data
+          "SRF_RADIO" AS source,
+          Transmission.Channel AS channel,
+          "srf" as enterpriseUnit,
+          "audio" AS mediaType,
+          ProgramLenght AS duration,
+          
+          // Data in common model but not SRF (for now)
+          NULL AS persons,
+          NULL AS corporations,
+          
+          ID AS sourceId,
+          CONCAT("SRF_RADIO_", ID) AS id,
+          
+          (SELECT COALESCE(TRIM(TRY_PARSE(Abstract, r""".+<.+:(.*)""")), Abstract) FROM Item) AS abstracts,
+          MKSTRING((SELECT COALESCE(TRIM(TRY_PARSE(Abstract, r""".+<.+:(.*)""")), Abstract) FROM Item), "\n\n") AS abstract,
+          
+          // programTitle first non null in the order or null if all null
+          COALESCE(BroadcastTitle, SeriesTitle, ProgramTitle) AS programTitle,
+          // programTitle source for debug purpose
+          CASE
+              WHEN BroadcastTitle IS NOT NULL THEN "BroadcastTitle"
+              WHEN SeriesTitle IS NOT NULL THEN "SeriesTitle"
+              WHEN ProgramTitle IS NOT NULL THEN "ProgramTitle"
+              ELSE NULL
+          END AS programTitleSource,
+          
+          // title construction:
+          //   Use SeriesTitle and ProgramTitle concatened if both not null,
+          //   or just ProgramTitle if not null,
+          //   or just SeriesTitle if not null,
+          //   or BroadcastTitle (if not null) (same as programTitle) with date (join by a "vom" since it is German speaking programs)
+          //   finally if there is nothing just null
+          CASE
+             WHEN ProgramTitle IS NOT NULL AND SeriesTitle IS NOT NULL THEN CONCAT(SeriesTitle, ": ", ProgramTitle)
+             WHEN ProgramTitle IS NOT NULL THEN ProgramTitle
+             WHEN SeriesTitle IS NOT NULL THEN SeriesTitle
+             WHEN BroadcastTitle IS NOT NULL THEN
+                 CONCAT(BroadcastTitle, " vom ", 
+                         cast((day(Transmission.ProgramDate)) as string),
+                         ".",
+                         cast((month(Transmission.ProgramDate)) as string),
+                         ".",
+                         cast((year(Transmission.ProgramDate)) as string)
+                  )
+             ELSE NULL
+          END AS title,
+          
+          // Parse ISO8601 for publicationTimestamp
+          Transmission.ProgramDate AS publicationTimestamp,
+          // Keep ISO8601 for publicationDate
+          cast(Transmission.ProgramDate as string) + "Z" AS publicationDate,
+          
+          // Chapters nested objects creation
+          (SELECT 
+               ItemTitle AS title,
+               // Remove the Geographics data at the start of abstract. If regex not found (null) use the normal Abstract
+               COALESCE(TRIM(TRY_PARSE(Abstract, r""".+<.+:(.*)""")), Abstract) AS abstract,
+               NULL AS geographicals,
+               (SELECT LOWER(TRIM(TopicTerm)) FROM TopicDescriptor) as topics,
+               (SELECT RightTerm FROM Rights) as rights
+          FROM Item) AS chapters,
+          
+          // Flattened Geo
+          NULL AS geographicals,
+          
+          // Flattened Topic
+          (IF CCOUNT((SELECT TopicTerm FROM Item, TopicDescriptor)) > 0
+              THEN (SELECT LOWER(TRIM(TopicTerm)) FROM Item, TopicDescriptor)
+              ELSE NULL) AS topics,
+              
+          // Flattened Right
+          (IF CCOUNT((SELECT RightTerm FROM Item, Rights)) > 0
+              THEN (SELECT RightTerm FROM Item, Rights)
+              ELSE NULL) AS rights,
+        
+          // Media URL
+          CASE
+              WHEN CCOUNT(SELECT m.mediaId FROM mediaIds m WHERE lower(ID) = lower(m.faroId)) >= 1 THEN CONCAT("https://www.srf.ch/play/tv/redirect/detail/", CFIRST(SELECT m.mediaId FROM mediaIds m WHERE  lower(ID) = lower(m.faroId)))
+              ELSE NULL
+          END as mediaURL,
+          
+          // Image URL (Using same query as TV, but not sure if we have images for Radio in mediaIds)
+          CASE
+              WHEN CCOUNT(SELECT m.imageUrl FROM mediaIds m WHERE lower(ID) = lower(m.faroId)) >= 1 THEN CFIRST(SELECT m.imageUrl FROM mediaIds m WHERE lower(ID) = lower(m.faroId))
+              ELSE NULL
+          END as imageURL
+
+      FROM srf_radio_ids     
+};
+
+srf_tv_ids := {
+  TYPEALIAS t :=  record(
+        Program: collection(
+            record(
+                ID: string,
+                BroadcastTitle: string nullable,
+                Transmission: record(ProgramDate: timestamp nullable, Channel: string nullable) nullable,
+                ProgramTitle: string nullable,
+                SeriesTitle: string nullable,
+                ProgramLenght: int nullable,
+                Item: collection(
+                    record(
+                        ItemTitle: string nullable,
+                        Abstract: string nullable,
+                        Rights: collection(record(RightTerm: string) nullable),
+                        GeoDescriptor: collection(
+                            record(GeoTerm: string) nullable),
+                        TopicDescriptor: collection(
+                            record(TopicTerm: string) nullable))))));
+    SELECT p
+    FROM
+    read_many_xml[t]("s3://rawlabs-private-test-data/SSR/Program_SRF_TV_20010101-20051231__new_v2/Program_SRF_TV_*.xml") f, f.Program p
+};
+
+extract_srf_abstract_parts :=
+    \(stringValue: string) -> {
+        parts := (select c from c in split(stringValue, ":"));    
+        
+        // extracts geo parts    
+        result := (select 
+                        part as fullPart
+                        ,(// extracts the first part (country) of geo tag that is followed by a less than sign  
+                          select * from (
+                          select 
+                              TRY_PARSE(c, r"""^(.+)<.+$""") as extract
+                              ,"Country" as extractType
+                              ,5 as gradeOfConfidence 
+                          from c in part
+                          where
+                              part like "%<%") x0                      
+                          union all
+                          // extracts the second part (location) of geo tag that follows the a less than sign 
+                          // and is followed by a comma
+                          select * from (
+                          select 
+                              TRY_PARSE(c, r"""^.+<(.+),.+$""") as extract
+                              ,"Location" as extractType
+                              ,5 as gradeOfConfidence 
+                          from c in part
+                          where
+                              part like "%<%" and part like "%,%") x1
+                          union all
+                          // extracts the second part (location) of geo tag that follows the a less than sign 
+                          // and is not followed by a comma
+                          select * from (
+                          select 
+                              TRY_PARSE(c, r"""^.+<(.+)$""") as extract
+                              ,"Location" as extractType
+                              ,5 as gradeOfConfidence 
+                          from c in part
+                          where
+                              part like "%<%" and part not like "%,%") x2                      
+                          union all
+                          // extracts the third part (state) of geo tag that follows the comma
+                          select * from (
+                          select 
+                              TRIM(TRY_PARSE(c, r"""^.+,(.+)$""")) as extract
+                              ,"State" as extractType
+                              ,5 as gradeOfConfidence 
+                          from c in part
+                          where 
+                              part like "%,%") x3) as extractedPart
+                    from 
+                        part in parts
+                    where
+                        part like "%<%"
+                    union all
+                    // extracts geo parts with no less than sign but have a commas
+                    // this process is not relevant if the returned values are not cross-checked using
+                    // a geo name database
+                    select 
+                        part as fullPart
+                        ,(select 
+                              c as extract
+                              ,"Country" as extractType
+                              ,1 as gradeOfConfidence 
+                          from c in split(part, ","))  as extractedPart
+                    from 
+                        part in parts
+                    where    
+                        part not like "%<%" and part like "%,%");
+            
+        select 
+            r.fullPart
+            ,(select d from d in r.extractedPart where d.extract is not null) as extracts
+        from r in result
+    };
+
+srf_tv_common := {
+    SELECT
+        "SRF_TV" AS source,
+        Transmission.Channel AS channel,
+        "srf" as enterpriseUnit,
+        "video" AS mediaType,
+        ProgramLenght AS duration,
+        
+        // Data in common model but not SRF (for now)
+        NULL AS persons,
+        NULL AS corporations,
+        
+        ID AS sourceId,
+        CONCAT("SRF_TV_", ID) AS id,
+        
+        (SELECT COALESCE(TRIM(TRY_PARSE(Abstract, r""".+<.+:(.*)""")), Abstract) FROM Item) AS abstracts,
+        MKSTRING((SELECT COALESCE(TRIM(TRY_PARSE(Abstract, r""".+<.+:(.*)""")), Abstract) FROM Item), "\n\n") AS abstract,
+        
+        // programTitle first non null in the order or null if all null
+        COALESCE(BroadcastTitle, SeriesTitle, ProgramTitle) AS programTitle,
+        // programTitle source for debug purpose
+        CASE
+            WHEN BroadcastTitle IS NOT NULL THEN "BroadcastTitle"
+            WHEN SeriesTitle IS NOT NULL THEN "SeriesTitle"
+            WHEN ProgramTitle IS NOT NULL THEN "ProgramTitle"
+            ELSE NULL
+        END AS programTitleSource,
+        
+        // title construction:
+        //   Use SeriesTitle and ProgramTitle concatened if both not null,
+        //   or just ProgramTitle if not null,
+        //   or just SeriesTitle if not null,
+        //   or BroadcastTitle (if not null) (same as programTitle) with date (join by a "vom" since it is German speaking programs)
+        //   finally if there is nothing just null
+        CASE
+           WHEN ProgramTitle IS NOT NULL AND SeriesTitle IS NOT NULL THEN CONCAT(SeriesTitle, ": ", ProgramTitle)
+           WHEN ProgramTitle IS NOT NULL THEN ProgramTitle
+           WHEN SeriesTitle IS NOT NULL THEN SeriesTitle
+           WHEN BroadcastTitle IS NOT NULL THEN
+               CONCAT(BroadcastTitle, " vom ", 
+                       cast((day(Transmission.ProgramDate)) as string),
+                       ".",
+                       cast((month(Transmission.ProgramDate)) as string),
+                       ".",
+                       cast((year(Transmission.ProgramDate)) as string)
+                )
+           ELSE NULL
+        END AS title,
+        
+        // Parse ISO8601 for publicationTimestamp
+        Transmission.ProgramDate AS publicationTimestamp,
+        // Keep ISO8601 for publicationDate
+        cast(Transmission.ProgramDate as string) + "Z" AS publicationDate,
+        
+        // Chapters nested objects creation
+        (SELECT 
+             ItemTitle AS title,
+             // Remove the Geographics data at the start of abstract. If regex not found (null) use the normal Abstract
+             COALESCE(TRIM(TRY_PARSE(Abstract, r""".+<.+:(.*)""")), Abstract) AS abstract,
+             (select
+                r.extract
+              from d in (select distinct 
+                            geot.extracts
+                        from geot in extract_srf_abstract_parts(Abstract)), r in d where r.gradeOfConfidence > 1
+              union
+              SELECT distinct GeoTerm FROM GeoDescriptor) AS geographicals,
+             (SELECT LOWER(TRIM(TopicTerm)) FROM TopicDescriptor) as topics,
+             (SELECT RightTerm FROM Rights) as rights
+        FROM Item) AS chapters,
+        
+        // Flattened Geo
+        (IF CCOUNT((select
+                        lower(trim(r.extract))
+                    from d in (select distinct
+                                    geot.extracts
+                               from i in Item, geot in extract_srf_abstract_parts(i.Abstract)), r in d where r.gradeOfConfidence > 1
+                  )) > 0 THEN ( select
+                                    lower(trim(r.extract))
+                                from d in (select distinct
+                                                geot.extracts
+                                            from i in Item, geot in extract_srf_abstract_parts(i.Abstract)), r in d where r.gradeOfConfidence > 1
+                                )
+        ELSE (SELECT distinct LOWER(TRIM(GeoTerm)) FROM Item, GeoDescriptor)) AS geographicals,
+
+        // Flattened Topic
+        (IF CCOUNT((SELECT TopicTerm FROM Item, TopicDescriptor)) > 0
+            THEN (SELECT LOWER(TRIM(TopicTerm)) FROM Item, TopicDescriptor)
+            ELSE NULL) AS topics,
+            
+        // Flattened Right
+        (IF CCOUNT((SELECT RightTerm FROM Item, Rights)) > 0
+            THEN (SELECT RightTerm FROM Item, Rights)
+            ELSE NULL) AS rights,
+
+        // Media URL
+        CASE
+            WHEN CCOUNT(SELECT m.mediaId FROM mediaIds m WHERE lower(ID) = lower(m.faroId)) >= 1 THEN CONCAT("https://www.srf.ch/play/tv/redirect/detail/", CFIRST(SELECT m.mediaId FROM mediaIds m WHERE  lower(ID) = lower(m.faroId)))
+            ELSE NULL
+        END as mediaURL,
+                
+        // image URL
+        CASE
+            WHEN CCOUNT(SELECT m.imageUrl FROM mediaIds m WHERE lower(ID) = lower(m.faroId)) >= 1 THEN CFIRST(SELECT m.imageUrl FROM mediaIds m WHERE lower(ID) = lower(m.faroId))
+            ELSE NULL
+        END as imageURL
+
+    FROM srf_tv_ids
+};
+
+tv_shows_query0() := {
+    SELECT 
+        id,
+        source AS source_s,
+        sourceId AS sourceId_s,
+        enterpriseUnit AS enterpriseUnit_s,
+        channel AS channel_s,
+        title AS title_tde,
+        title AS title_tde_exact_ns,
+        abstracts AS abstract_tdes,
+        abstracts AS abstract_tdes_exact_ns,
+        publicationDate AS publicationDate_dt,
+        mediaType AS mediaType_s,
+        duration AS duration_i,
+        programTitle AS programTitle_s,
+        programTitle AS programTitle_tde_ns,
+        programTitle AS programTitle_tde_exact_ns,
+        topics AS topics_ss,
+        topics AS topics_tdes_ns,
+        topics AS topics_tdes_exact_ns,
+        geographicals AS geographicals_ss,
+        geographicals AS geographicals_tdes_ns,
+        geographicals AS geographicals_tdes_exact_ns,
+        persons AS persons_ss,
+        persons AS persons_tdes_ns,
+        persons AS persons_tdes_exact_ns,
+        corporations AS corporations_ss,
+        corporations AS corporations_tdes_ns,
+        corporations AS corporations_tdes_exact_ns,
+        mediaURL AS mediaURL_s,
+        imageURL AS imageURL_s,
+        CONCAT(title, " " + programTitle, " " +
+        MKSTRING(abstracts, " ")) AS fuzzy_tde_ns
+    FROM srf_tv_common
+};
+
+tv_shows2_query_srf_radio() := {
+    SELECT
+          id,
+          source AS source_s,
+          sourceId AS sourceId_s,
+          enterpriseUnit AS enterpriseUnit_s,
+          channel AS channel_s,
+          title AS title_tde,
+          title AS title_tde_exact_ns,
+          abstracts AS abstract_tdes,
+          abstracts AS abstract_tdes_exact_ns,
+          publicationDate AS publicationDate_dt,
+          mediaType AS mediaType_s,
+          duration AS duration_i,
+          programTitle AS programTitle_s,
+          programTitle AS programTitle_tde_ns,
+          programTitle AS programTitle_tde_exact_ns,
+          topics AS topics_ss,
+          topics AS topics_tdes_ns,
+          topics AS topics_tdes_exact_ns,
+          geographicals AS geographicals_ss,
+          geographicals AS geographicals_tdes_ns,
+          geographicals AS geographicals_tdes_exact_ns,
+          persons AS persons_ss,
+          persons AS persons_tdes_ns,
+          persons AS persons_tdes_exact_ns,
+          corporations AS corporations_ss,
+          corporations AS corporations_tdes_ns,
+          corporations AS corporations_tdes_exact_ns,
+          mediaURL AS mediaURL_s,
+          imageURL AS imageURL_s,   
+
+          CONCAT(title, " " + programTitle, " " +
+          MKSTRING(abstracts, " ")) AS fuzzy_tde_ns
+    FROM srf_radio_common
+};
